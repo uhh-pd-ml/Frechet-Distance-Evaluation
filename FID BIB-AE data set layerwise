@@ -1,0 +1,480 @@
+# In[1]:
+
+
+from __future__ import print_function
+import argparse
+import os
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+from torch.nn.functional import adaptive_avg_pool2d
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import torch.nn.functional as F
+import torchvision.models as models
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib as mpl
+
+from IPython.display import HTML
+
+from scipy import linalg
+
+import matplotlib.pyplot as plt
+import sys
+
+import pandas as pd
+import h5py
+
+import glob
+
+import calorimeter_functions as cf
+import torch.nn.functional as F
+
+import statistics
+
+
+# In[2]:
+
+
+import torchvision.models as models
+import torch.nn.functional as F
+from scipy import linalg
+
+import torch
+import torch.nn as nn
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+
+# In[3]:
+
+
+SEED=42
+random.seed(SEED)
+torch.manual_seed(SEED)
+# Batch size during training
+batch_size = 200
+# Spatial size of training images. All images will be resized to this size using a transformer.
+image_size = 64
+# Number of channels in the training images. For color images this is 3
+nc = 3
+# Size of z latent vector (i.e. size of generator input)
+#nz = 100
+# Size of feature maps in generator
+#ngf = 64
+# Size of feature maps in discriminator
+#ndf = 64
+# Number of training epochs
+num_epochs = 10
+# different Learning rate for optimizers
+#g_lr = 0.0001
+#d_lr = 0.0004
+# Beta1 hyperparam for Adam optimizers
+#beta1 = 0.5
+#ngpu=1
+
+
+# In[4]:
+
+
+fid_list = []
+
+
+# In[5]:
+
+
+# Import Real Data
+data_real = h5py.File('/beegfs/desy/user/werthern/CalorimeterData/for_Nana/Epoch_x_Real.h5')
+real_img = cf.resizeRealImagesLayer(data_real)
+print(real_img.shape)
+
+
+# In[6]:
+
+
+# Import Real Energy
+real_energy = cf.resizeRealEnergy(data_real)
+print(real_energy.shape)
+
+
+# In[7]:
+
+
+# Decide which device we want to run on
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+class InceptionV3(nn.Module):
+    """Pretrained InceptionV3 network returning feature maps"""
+
+    # Index of default block of inception to return,
+    # corresponds to output of final average pooling
+    DEFAULT_BLOCK_INDEX = 3
+
+    # Maps feature dimensionality to their output blocks indices
+    BLOCK_INDEX_BY_DIM = {
+        64: 0,   # First max pooling features
+        192: 1,  # Second max pooling featurs
+        768: 2,  # Pre-aux classifier features
+        2048: 3  # Final average pooling features
+    }
+
+    def __init__(self,
+                 output_blocks=[DEFAULT_BLOCK_INDEX],
+                 resize_input=True,
+                 normalize_input=True,
+                 requires_grad=False):
+
+        super(InceptionV3, self).__init__()
+
+        self.resize_input = resize_input
+        self.normalize_input = normalize_input
+        self.output_blocks = sorted(output_blocks)
+        self.last_needed_block = max(output_blocks)
+
+        assert self.last_needed_block <= 3,             'Last possible output block index is 3'
+
+        self.blocks = nn.ModuleList()
+
+
+        inception = models.inception_v3(pretrained=True)
+
+        # Block 0: input to maxpool1
+        block0 = [
+            inception.Conv2d_1a_3x3,
+            inception.Conv2d_2a_3x3,
+            inception.Conv2d_2b_3x3,
+            nn.MaxPool2d(kernel_size=3, stride=2)
+        ]
+        self.blocks.append(nn.Sequential(*block0))
+
+        # Block 1: maxpool1 to maxpool2
+        if self.last_needed_block >= 1:
+            block1 = [
+                inception.Conv2d_3b_1x1,
+                inception.Conv2d_4a_3x3,
+                nn.MaxPool2d(kernel_size=3, stride=2)
+            ]
+            self.blocks.append(nn.Sequential(*block1))
+
+        # Block 2: maxpool2 to aux classifier
+        if self.last_needed_block >= 2:
+            block2 = [
+                inception.Mixed_5b,
+                inception.Mixed_5c,
+                inception.Mixed_5d,
+                inception.Mixed_6a,
+                inception.Mixed_6b,
+                inception.Mixed_6c,
+                inception.Mixed_6d,
+                inception.Mixed_6e,
+            ]
+            self.blocks.append(nn.Sequential(*block2))
+
+        # Block 3: aux classifier to final avgpool
+        if self.last_needed_block >= 3:
+            block3 = [
+                inception.Mixed_7a,
+                inception.Mixed_7b,
+                inception.Mixed_7c,
+                nn.AdaptiveAvgPool2d(output_size=(1, 1))
+            ]
+            self.blocks.append(nn.Sequential(*block3))
+
+        for param in self.parameters():
+            param.requires_grad = requires_grad
+
+    def forward(self, inp):
+        """Get Inception feature maps
+        Parameters
+        ----------
+        inp : torch.autograd.Variable
+            Input tensor of shape Bx3xHxW. Values are expected to be in
+            range (0, 1)
+        Returns
+        -------
+        List of torch.autograd.Variable, corresponding to the selected output
+        block, sorted ascending by index
+        """
+        outp = []
+        x = inp
+
+        if self.resize_input:
+            x = F.interpolate(x,
+                              size=(299, 299),
+                              mode='bilinear',
+                              align_corners=False)
+
+        if self.normalize_input:
+            x = 2 * x - 1  # Scale from range (0, 1) to range (-1, 1)
+
+        for idx, block in enumerate(self.blocks):
+            x = block(x)
+            if idx in self.output_blocks:
+                outp.append(x)
+
+            if idx == self.last_needed_block:
+                break
+
+        return outp
+
+block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
+model = InceptionV3([block_idx])
+model=model.cuda()
+
+
+# In[ ]:
+
+
+mean_fid_list = []
+
+for i in range (1,36):
+    # paper model, trained by Sascha, epoch (1-35) WITHOUT PP
+    weights = '/beegfs/desy/user/diefenbs/VAE_results/2020_KW13/3D_M_BiBAESmLVar_P_None_C_ConvDiffv3_CL_Default_KLD005_MDL__L24_512_1MCor/check_3D_M_BiBAESmLVar_P_None_C_ConvDiffv3_CL_Default_KLD005_MDL__L24_512_1MCor_{}.pth'.format(i)
+    
+    ## output files
+    directory = '/beegfs/desy/user/werthern/CalorimeterData/for_Nana/allData'
+    f_name = 'Epoch_{}_Fake.h5'.format(i)
+    use_PP = False
+    
+    numEvents = 49800 # 85000 max
+    fake_images = cf.generateData(weights,directory,f_name,numEvents,real_energy,use_PP)
+    #print(fake_images.shape)
+    #fake_data = h5py.File('/beegfs/desy/user/werthern/CalorimeterData/for_Nana/allData/Epoch_{}_Fake.h5'.format(i))
+    #print(fake_data.keys())
+    
+    fake_img = cf.resizeFakeImagesLayer(fake_images)
+    print(fake_img.shape)
+    
+    act_real_list = []
+    act_fake_list = []
+    #iters = 0
+    
+    print("start calculating acts")
+    for x,y in zip(real_img, fake_img):
+        for i in range(0, len(x), batch_size):
+             data_batch_real = x[i:i+200]
+             data_batch_real = data_batch_real.float()
+                
+             act_real = cf.calculate_act(data_batch_real,model,batch_size=200, dims=2048, cuda=True)
+             act_real_list.append(act_real)
+                
+        for i in range(0, len(y), batch_size):    
+             data_batch_fake = y[i:i+200]
+             data_batch_fake = data_batch_fake.float()
+
+             act_fake = cf.calculate_act(data_batch_fake,model,batch_size=200, dims=2048, cuda=True)
+             act_fake_list.append(act_fake)
+        print("finished calculating acts for layer")
+            
+        act_real_all = np.vstack(act_real_list)
+        act_fake_all = np.vstack(act_fake_list)
+
+        mu_real = np.mean(act_real_all, axis=0)
+        sigma_real = np.cov(act_real_all, rowvar=False)
+        mu_fake = np.mean(act_fake_all, axis=0)
+        sigma_fake = np.cov(act_fake_all, rowvar=False)
+
+
+        fid_value = cf.calculate_fretchet_distance(mu_real, sigma_real, mu_fake, sigma_fake)
+        fid_list.append(fid_value)
+    
+        print("FID Value Layer: ")
+        print(fid_value)
+        
+    mean_fid = statistics.mean(fid_list)
+    print("Mean FID: ")
+    print(mean_fid)
+    mean_fid_list.append(mean_fid)
+
+
+# In[ ]:
+
+
+np.savetxt('/beegfs/desy/user/werthern/CalorimeterData/FID_Calorimeter_Layer_new.txt', mean_fid_list)
+print("saving done")
+print(mean_fid_list)
+
+
+# In[ ]:
+
+
+#mean_fid_list = [2.3205161341682685,2.133412288979223,1.4969531894805537,1.3908072683213133,1.113855536998911,0.7195247140932769,0.6955375543748815,0.8592929455339806,4.102103859346575,4.352474839379034, 4.425081662913078]
+#a = [1,5,10,15,20,25,30,35,40,45,49]
+
+#plt.plot(a, mean_fid_list)
+#plt.scatter(a, mean_fid_list)
+#plt.xlabel('Epochs')
+#plt.ylabel('FID')
+#plt.show()
+
+
+# In[ ]:
+
+
+#a = []
+#for i in range (1,35):
+#    a.append(i)
+
+#plt.plot(a, mean_fid_list)
+#plt.xlabel('Epochs')
+#plt.ylabel('FID')
+#plt.show()
+#plt.savefig('/beegfs/desy/user/werthern/CalorimeterData/FID_Calorimeter_Layer_test.png')
+#print("saving done")
+
+
+# In[ ]:
+
+
+mean_fid_list_PP = []
+print("start calculating")
+
+for i in range (47,50):
+    # paper model, trained by Sascha, epoch (1-35) WITHOUT PP
+    weights = '/beegfs/desy/user/diefenbs/VAE_results/2020_KW13/3D_M_BiBAESmLVar_P_1ConvEconV2_C_ConvDiffv3_CL_Default_KLD005_MDL_PMDKS_L24_512_1MCor/check_3D_M_BiBAESmLVar_P_1ConvEconV2_C_ConvDiffv3_CL_Default_KLD005_MDL_PMDKS_L24_512_1MCor_{}.pth'.format(i)
+
+    directory = '/beegfs/desy/user/werthern/CalorimeterData/for_Nana/allData'
+    f_name = 'Epoch_{}_Fake.h5'.format(i)
+    use_PP = True
+    
+    numEvents = 49800 # 85000 max
+    fake_images = cf.generateData(weights,directory,f_name,numEvents,real_energy,use_PP)
+    print(fake_images.shape)
+    
+    fake_img = cf.resizeFakeImagesLayer(fake_images)
+    print(fake_img.shape)
+    
+    act_real_list = []
+    act_fake_list = []
+    #iters = 0
+    
+    print("start calculating acts")
+    for x,y in zip(real_img, fake_img):
+        for i in range(0, len(x), batch_size):
+             data_batch_real = x[i:i+200]
+             data_batch_real = data_batch_real.float()
+                
+             act_real = cf.calculate_act(data_batch_real,model,batch_size=200, dims=2048, cuda=True)
+             act_real_list.append(act_real)
+                
+        for i in range(0, len(y), batch_size):    
+             data_batch_fake = y[i:i+200]
+             data_batch_fake = data_batch_fake.float()
+
+             act_fake = cf.calculate_act(data_batch_fake,model,batch_size=200, dims=2048, cuda=True)
+             act_fake_list.append(act_fake)
+            
+        act_real_all = np.vstack(act_real_list)
+        act_fake_all = np.vstack(act_fake_list)
+
+        mu_real = np.mean(act_real_all, axis=0)
+        sigma_real = np.cov(act_real_all, rowvar=False)
+        mu_fake = np.mean(act_fake_all, axis=0)
+        sigma_fake = np.cov(act_fake_all, rowvar=False)
+
+
+        fid_value = cf.calculate_fretchet_distance(mu_real, sigma_real, mu_fake, sigma_fake)
+        fid_list.append(fid_value)
+    
+    #    print("FID Value Layer: ")
+    #    print(fid_value)
+        
+    mean_fid = statistics.mean(fid_list)
+    print(i)
+    print("Mean FID: ")
+    print(mean_fid)
+    mean_fid_list_PP.append(mean_fid)
+
+
+# In[ ]:
+
+
+#np.savetxt('/beegfs/desy/user/werthern/CalorimeterData/FID_Calorimeter_Layer_PP_new.txt', mean_fid_list_PP)
+print("saving done")
+
+print(mean_fid_list_PP)
+
+
+# In[ ]:
+
+
+mean_fid_list = [2.236031095617301,1.9753196666283688,1.8972955780771374,1.728042891636762,2.1096688917886057,2.053136477509251,1.5148861738706383,1.8380710959172857,1.832767262587168,1.2931970033003248,1.2573213121273186,1.088672372782663,0.7549644013144037,0.8328991984476033,1.3049110384674107,1.1411251987089999,1.1808374514928628,1.1906225758662121,0.9266534657164378,0.9752690695720618,0.8637169392822107,1.0546345593062065,0.8977058282442792,0.7970633649460578,0.7696963237683693,1.0824732577201222,0.8962891462771746,0.8255277256855124,0.853257479785314,0.7913349809533712,0.8059033595247731,0.8605033677699768,0.8305480082629773,0.7103935855809633,0.7693527739365656]
+mean_fid_list_PP = [0.6130513346212628,1.1949061654672832,2.2287564425797304,2.3709200104696135]
+
+
+# In[ ]:
+
+
+fid_sum = sum(mean_fid_list)
+fid_norm = [x / fid_sum for x in mean_fid_list]
+print(fid_norm)
+
+fid_sum_PP = sum(mean_fid_list_PP)
+fid_norm_PP = [x / fid_sum_PP for x in mean_fid_list_PP]
+print(fid_norm_PP)
+
+
+# In[ ]:
+
+
+a = []
+for i in range (1,36):
+    a.append(i)
+    
+b = []
+for i in range (36,50):
+    b.append(i)
+
+plt.figure(figsize=(8,6), dpi=100, facecolor='none')
+plt.plot(a, fid_norm, label="without Post Processing", color='darkblue')
+plt.scatter(a, fid_norm)
+plt.plot(b, fid_norm_PP, label="with Post Processing",color='lightblue')
+plt.scatter(a, fid_norm_PP)
+plt.legend(loc='upper right', fontsize=10, edgecolor='none')
+plt.title("FID for Calorimeter Data, layerwise \n",fontsize=15)
+plt.xlabel('Epoch')
+plt.ylabel('Frechet Inception Distance')
+plt.show()
+#plt.savefig('/beegfs/desy/user/werthern/CalorimeterData/FID_Calorimeter_Layer_new.png')
+print("saving done")
+
+
+# In[ ]:
+
+
+a = []
+for i in range (1,36):
+    a.append(i)
+    
+b = []
+for i in range (36,50):
+    b.append(i)
+
+plt.figure(figsize=(8,6), dpi=100, facecolor='none')
+plt.plot(a, mean_fid_list, label="without Post Processing", color='darkblue')
+plt.scatter(a, mean_fid_list)
+plt.plot(b, mean_fid_list_PP, label="with Post Processing",color='lightblue')
+plt.scatter(a, mean_fid_list_PP)
+plt.legend(loc='upper right', fontsize=10, edgecolor='none')
+plt.title("FID for Calorimeter Data, layerwise \n",fontsize=15)
+plt.xlabel('Epoch')
+plt.ylabel('Frechet Inception Distance')
+plt.show()
+#plt.savefig('/beegfs/desy/user/werthern/CalorimeterData/FID_Calorimeter_Layer_new.png')
+print("saving done")
+
+
+# In[ ]:
+
+
+
+
