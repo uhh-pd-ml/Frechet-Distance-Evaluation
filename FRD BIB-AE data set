@@ -1,0 +1,706 @@
+# In[1]:
+
+
+from __future__ import print_function
+import argparse
+import os
+import random
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+from torch.nn.functional import adaptive_avg_pool2d
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import torch.nn.functional as F
+import torchvision.models as models
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib as mpl
+
+from IPython.display import HTML
+
+from scipy import linalg
+
+import matplotlib.pyplot as plt
+import sys
+
+import pandas as pd
+import h5py
+
+import glob
+
+import regression_functions as rf
+import torch.nn.functional as F
+import tables
+
+from models.getting_high_constrainer_frechet import energyRegressor
+ngpu = 1
+cuda = True if torch.cuda.is_available() else False
+FloatTensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
+
+
+# In[2]:
+
+
+SEED=42
+random.seed(SEED)
+torch.manual_seed(SEED)
+batch_size = 10
+image_size = 64
+nc = 3
+num_epochs = 10
+numEvents = 49800
+
+
+# In[3]:
+
+
+# Import Real Data
+data_real = h5py.File('/beegfs/desy/user/eren/test_area/ILDConfig/StandardConfig/production/50k.hdf5')
+real_images = np.array(data_real['30x30']['layers'])
+real_images_expand = np.expand_dims(real_images, axis = 1)
+real_img = torch.tensor(real_images_expand).cpu()
+print(real_img.shape)
+real_img=real_img[0:numEvents]
+print(real_img.shape)
+
+
+# In[4]:
+
+
+# Import Real Energy
+real_energy = rf.resizeRealEnergyRegression(data_real)
+print(real_energy.shape)
+
+
+# In[6]:
+
+
+################ Import Network + Weights #################
+net = energyRegressor().to(device)
+
+checkpoint = torch.load('/beegfs/desy/user/werthern/Regression/For_Nana/Output/Regressor_Test_J/TestJ_89.pt', map_location=torch.device(device))
+net.load_state_dict(checkpoint['Angular Constrainer'])
+#optim.load_state_dict(checkpoint['Angular Constrainer optimizer'])
+epoch = checkpoint['epoch']
+train_loss = checkpoint['Training loss']
+validation_loss = checkpoint['Validation loss']
+
+print("Weights loaded")
+
+
+#nochmal ohne weights random initialized
+
+
+# In[8]:
+
+
+def count_parameters(model):
+    i, tot = 0, 0
+    for p in model.parameters():
+        print(i, p.numel())
+        i += 1
+        tot += p.numel()
+    print('total params: ', tot)
+    
+print(count_parameters(net))
+
+
+# In[ ]:
+
+
+print(time.strftime("%H:%M:%S"))
+fid_list_noPP = []
+fid_list_PP = []
+
+for i in range (1,36):
+   
+    data_fake = h5py.File('/beegfs/desy/user/werthern/Regression/For_Nana/fakeData/Fake_Energy_Epoch{}.h5'.format(i))
+    fake_images = np.array(data_fake['fake_images'])
+    fake_images_expand = np.expand_dims(fake_images, axis = 1)
+    fake_img = torch.tensor(fake_images_expand).cpu()
+    fake_img=fake_img[0:numEvents]
+    
+    with torch.no_grad():
+        net.eval()
+        
+        act_real_list = []
+        act_fake_list = []
+
+        print('calculating acts real...')
+        for j in range(0, len(real_img), batch_size):
+            real_img = real_img.float()
+            data_batch_real = real_img[j:j+200]
+            data_batch_real = data_batch_real.cuda()
+            #print(data_batch_real.type())
+
+            val_outputs_real, intermediate_outputs_real = net(data_batch_real)
+            act_real_list.append(intermediate_outputs_real.cpu())
+            #print('acts real batch ',j,': ',intermediate_outputs_real.shape)
+
+        print('calculating acts fake...')
+        for k in range(0, len(fake_img), batch_size):
+            fake_img = fake_img.float()
+            data_batch_fake = fake_img[k:k+200]
+            data_batch_fake = data_batch_fake.cuda()
+
+            val_outputs_fake, intermediate_outputs_fake = net(data_batch_fake)
+            act_fake_list.append(intermediate_outputs_fake.cpu())
+            #print('acts fake batch ',k,': ',intermediate_outputs_fake.shape)
+
+        act_real_all = np.vstack(act_real_list)
+        act_fake_all = np.vstack(act_fake_list)
+        
+        
+        print('finished calculating acts')
+        
+        mu_real = np.mean(act_real_all, axis=0)     #plotten
+        sigma_real = np.cov(act_real_all, rowvar=False)   #plotten auch nur mit trace
+        mu_fake = np.mean(act_fake_all, axis=0)
+        sigma_fake = np.cov(act_fake_all, rowvar=False)
+
+        print('calculating frechet distance...')
+
+        fid_value = rf.calculate_fretchet_distance(mu_real, sigma_real, mu_fake, sigma_fake)
+        fid_list_noPP.append(fid_value)
+
+        print('FD Value Epoch ',i,': ',fid_value)
+    
+    
+print(time.strftime("%H:%M:%S"))
+
+mu_fake_noPP = mu_fake
+sigma_fake_noPP = sigma_fake
+
+
+##################################################
+
+
+for i in range (36,50):
+   
+    data_fake = h5py.File('/beegfs/desy/user/werthern/Regression/For_Nana/fakeData/Fake_Energy_Epoch{}PP.h5'.format(i))
+    fake_images = np.array(data_fake['fake_images'])
+    fake_images_expand = np.expand_dims(fake_images, axis = 1)
+    fake_img = torch.tensor(fake_images_expand).cpu()
+    fake_img=fake_img[0:numEvents]
+    
+    with torch.no_grad():
+        net.eval()
+        
+        act_real_list = []
+        act_fake_list = []
+
+        print('calculating acts real...')
+        for j in range(0, len(real_img), batch_size):
+            real_img = real_img.float()
+            data_batch_real = real_img[j:j+200]
+            data_batch_real = data_batch_real.cuda()
+            #print(data_batch_real.type())
+
+            val_outputs_real, intermediate_outputs_real = net(data_batch_real)
+            act_real_list.append(intermediate_outputs_real.cpu())
+            #print('acts real batch ',j,': ',intermediate_outputs_real.shape)
+
+        print('calculating acts fake...')
+        for k in range(0, len(fake_img), batch_size):
+            fake_img = fake_img.float()
+            data_batch_fake = fake_img[k:k+200]
+            data_batch_fake = data_batch_fake.cuda()
+
+            val_outputs_fake, intermediate_outputs_fake = net(data_batch_fake)
+            act_fake_list.append(intermediate_outputs_fake.cpu())
+            #print('acts fake batch ',k,': ',intermediate_outputs_fake.shape)
+
+        act_real_all = np.vstack(act_real_list)
+        act_fake_all = np.vstack(act_fake_list)
+        
+        
+        print('finished calculating acts')
+        
+        mu_real = np.mean(act_real_all, axis=0)     #plotten
+        sigma_real = np.cov(act_real_all, rowvar=False)   #plotten auch nur mit trace
+        mu_fake = np.mean(act_fake_all, axis=0)
+        sigma_fake = np.cov(act_fake_all, rowvar=False)
+
+        print('calculating frechet distance...')
+
+        fid_value = rf.calculate_fretchet_distance(mu_real, sigma_real, mu_fake, sigma_fake)
+        fid_list_PP.append(fid_value)
+
+        print('FD Value Epoch ',i,' PP: ',fid_value)
+    
+    
+print(time.strftime("%H:%M:%S"))
+
+mu_fake_PP = mu_fake
+sigma_fake_PP = sigma_fake
+
+
+# In[ ]:
+
+
+tables.file._open_files.close_all()
+
+
+# In[ ]:
+
+
+a = []
+for i in range (1,36):
+    a.append(i)
+    
+b = []
+for i in range (36,50):
+    b.append(i)
+
+plt.figure(figsize=(8,6), dpi=100, facecolor='none')
+plt.plot(a, fid_list_noPP, label="Energy Regressor without Post Processing", color='darkblue')
+plt.plot(a, fid_list_noPP_TestK, label="Energy Regressor Retrained without Post Processing",color='darkgreen')
+plt.plot(a, fid_list_noPP_constrainer, label="Energy Regressor + without Post Processing",color='red')
+plt.plot(b, fid_list_PP, label="Energy Regressor with Post Processing",color='lightblue')
+plt.plot(b, fid_list_PP_TestK, label="Energy Regressor Retrained with Post Processing",color='lightgreen')
+plt.plot(b, fid_list_PP_constrainer, label="Energy Regressor + with Post Processing", color='orange')
+plt.legend(loc='upper right', fontsize=10, edgecolor='none')
+plt.title("FRD for Calorimeter Data, trained Network \n",fontsize=15)
+plt.xlabel('Epoch')
+plt.ylabel('Frechet Regression Distance')
+plt.show()
+plt.savefig('/beegfs/desy/user/werthern/Regression/For_Nana/frechetOutput/FD_Regression_1_49.png')
+print("saving done")
+
+
+# In[ ]:
+
+
+## Mu's Differenz Bar Plots
+
+acts=[]
+for i in range(0,100):
+    acts.append(i)
+
+differenz=mu_real-mu_fake_noPP
+differenzPP=mu_real-mu_fake_PP
+
+print('differenz')
+plt.figure(figsize=(8,6), dpi=100, facecolor='none')
+plt.bar(acts,differenz)
+plt.title("Difference between mean activations of real and fake images \n",fontsize=20)
+plt.xlabel('Activations')
+plt.ylabel('Difference')
+#plt.yscale('log')
+plt.ylim(-2,3)
+plt.show()
+plt.savefig('/beegfs/desy/user/werthern/Regression/For_Nana/frechetOutput/FD_Regression_Means.png')
+print("saving done")
+
+print('differenzPP')
+plt.figure(figsize=(8,6), dpi=100, facecolor='none')
+plt.bar(acts,differenzPP)
+plt.title("Difference between mean activations of real and fake images (with PP) \n",fontsize=20)
+plt.xlabel('Activations')
+plt.ylabel('Difference')
+#plt.yscale('log')
+plt.ylim(-2,3)
+plt.show()
+plt.savefig('/beegfs/desy/user/werthern/Regression/For_Nana/frechetOutput/FD_Regression_MeansPP.png')
+print("saving done")
+
+
+# In[ ]:
+
+
+## Mu's Bar Plots
+
+acts=[]
+for i in range(0,100):
+    acts.append(i)
+    
+    
+print('mu real')
+plt.bar(acts,mu_real)
+plt.yscale('log')
+plt.show()
+
+print('mu fake')
+plt.bar(acts,mu_fake_noPP)
+plt.yscale('log')
+plt.show()
+
+print('mu fake PP')
+plt.bar(acts,mu_fake_PP)
+plt.yscale('log')
+plt.show()
+
+
+######
+
+## Mu's Differenz Bar Plots
+
+differenz=mu_real-mu_fake_noPP
+differenzPP=mu_real-mu_fake_PP
+
+print('differenz')
+plt.bar(acts,differenz)
+#plt.yscale('log')
+plt.ylim(-2,3)
+plt.show()
+
+print('differenzPP')
+plt.bar(acts,differenzPP)
+#plt.yscale('log')
+plt.ylim(-2,3)
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Energiesumme
+    
+pixel_sum = np.sum(fake_images_PP, axis=(3,2,1))
+plt.hist(pixel_sum, bins=100)
+plt.title("Energiesumme Fake PP")
+plt.yscale('log')
+plt.show()
+
+pixel_sum = np.sum(fake_images_noPP, axis=(3,2,1))
+plt.hist(pixel_sum, bins=100)
+plt.title("Energiesumme Fake noPP")
+plt.yscale('log')
+plt.show()
+
+pixel_sum = np.sum(real_images, axis=(3,2,1))
+plt.hist(pixel_sum, bins=100)
+plt.title("Energiesumme real")
+plt.yscale('log')
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Zellenergie
+
+pixel_flat = fake_images.flatten()
+    
+mask = pixel_flat != 0.0
+pixel_flat = pixel_flat[mask]
+
+print(np.min(pixel_flat))
+print(np.max(pixel_flat))
+
+plt.hist(pixel_flat, bins=np.logspace(np.log10(10e-3),np.log10(41), 100))
+plt.title("Zellenergie")
+plt.yscale('log')
+plt.xscale('log')
+
+plt.show()
+
+
+##########
+
+pixel_flat = fake_images_EP39PP.flatten()
+    
+mask = pixel_flat != 0.0
+pixel_flat = pixel_flat[mask]
+
+print(np.min(pixel_flat))
+print(np.max(pixel_flat))
+
+plt.hist(pixel_flat, bins=np.logspace(np.log10(10e-3),np.log10(36), 100))
+plt.title("Zellenergie PP")
+plt.yscale('log')
+plt.xscale('log')
+
+plt.show()
+
+############
+
+pixel_flat = real_images.flatten()
+    
+mask = pixel_flat != 0.0
+pixel_flat = pixel_flat[mask]
+
+print(np.min(pixel_flat))
+print(np.max(pixel_flat))
+
+plt.hist(pixel_flat, bins=np.logspace(np.log10(10e-3),np.log10(63), 100))
+plt.title("Zellenergie real")
+plt.yscale('log')
+plt.xscale('log')
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Histograme Mu's und Sigma's
+
+plt.hist(mu_real.flatten(), bins=100, range=[-2,2])
+
+plt.title("Regression Network - Epoch 39 - Mu's Real Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+############
+
+plt.hist(sigma_real.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Sigma's Real Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+#############
+
+plt.hist(mu_fake_39.flatten(), bins=100, range=[-2,2])
+
+plt.title("Regression Network - Epoch 39 - Mu's Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+#############
+
+plt.hist(sigma_fake_39.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Sigma's Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+################
+
+plt.hist(mu_fake_39PP.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39PP - Mu's Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+################
+
+plt.hist(sigma_fake_39PP.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39PP - Sigma's Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Mu's Bar Plots
+
+acts=[]
+for i in range(0,100):
+    acts.append(i)
+    
+    
+print('mu real')
+plt.bar(acts,mu_real)
+plt.yscale('log')
+plt.show()
+
+print('mu fake')
+plt.bar(acts,mu_fake_39)
+plt.yscale('log')
+plt.show()
+
+print('mu fake PP')
+plt.bar(acts,mu_fake_39PP)
+plt.yscale('log')
+plt.show()
+
+
+######
+
+## Mu's Differenz Bar Plots
+
+differenz=mu_real-mu_fake_noPP
+differenzPP=mu_real-mu_fake_PP
+
+print('differenz')
+plt.bar(acts,differenz)
+#plt.yscale('log')
+plt.ylim(-12,1)
+plt.show()
+
+print('differenzPP')
+plt.bar(acts,differenzPP)
+#plt.yscale('log')
+plt.ylim(-12,1)
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Histogramm Trace(Sigma)
+
+trace_sigma_real=np.trace(sigma_real)
+plt.hist(trace_sigma_real.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Sigma Trace Real Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+###############
+
+trace_sigma_fake=np.trace(sigma_fake_39)
+plt.hist(trace_sigma_fake.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Sigma Trace fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+###############
+
+trace_sigma_fake_PP=np.trace(sigma_fake_39PP)
+plt.hist(trace_sigma_fake_PP.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39PP - Sigma Trace fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+## Histogramm Acts
+
+plt.hist(act_real_all.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Activation Statistics Real Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+#############
+
+plt.hist(acts_fake_test_PP.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 PP - Activation Statistics Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+##############
+
+plt.hist(acts_fake_test_noPP.flatten(), bins=100)
+
+plt.title("Regression Network - Epoch 39 - Activation Statistics Fake Images")
+#plt.xlabel("Energy [GeV]")
+#plt.ylabel("Events")
+plt.yscale('log')
+plt.show()
+
+
+# In[ ]:
+
+
+
+
